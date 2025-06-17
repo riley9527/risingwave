@@ -233,8 +233,6 @@ pub struct KafkaConfig {
     )]
     pub retry_interval: Duration,
 
-    pub enable_mux_reader: bool,
-
     /// We have parsed the primary key for an upsert kafka sink into a `usize` vector representing
     /// the indices of the pk columns in the frontend, so we simply store the primary key here
     /// as a string.
