@@ -117,18 +117,77 @@ impl KafkaMuxReader {
         Ok(reader)
     }
 
+    // async fn poll_loop(this: Arc<Self>) {
+    //     let mut stream = this.consumer.stream();
+    //     while let Some(res) = stream.next().await {
+    //         match res {
+    //             Ok(m) => {
+    //                 let owned = m.detach();
+    //                 let key = (owned.topic().to_owned(), owned.partition());
+    //                 if let Some(tx) = this.senders.read().await.get(&key) {
+    //                     let _ = tx.send(owned).await;
+    //                 }
+    //             }
+    //             Err(e) => tracing::error!("Kafka error: {e}"),
+    //         }
+    //     }
+    // }
+
     async fn poll_loop(this: Arc<Self>) {
         let mut stream = this.consumer.stream();
-        while let Some(res) = stream.next().await {
-            match res {
-                Ok(m) => {
-                    let owned = m.detach();
-                    let key = (owned.topic().to_owned(), owned.partition());
-                    if let Some(tx) = this.senders.read().await.get(&key) {
-                        let _ = tx.send(owned).await;
+        // The maximum number of messages to buffer in one chunk.
+        // This can be made configurable if needed.
+        const CHUNK_SIZE: usize = 1024;
+
+        #[for_await]
+        for messages_result in stream.ready_chunks(CHUNK_SIZE) {
+            // Step 1: Group messages by route (topic, partition)
+            // We use a temporary HashMap for efficient grouping.
+            let mut grouped_messages: HashMap<(String, i32), Vec<OwnedMessage>> = HashMap::new();
+
+            for res in messages_result {
+                match res {
+                    Ok(borrowed_msg) => {
+                        let owned_msg = borrowed_msg.detach();
+                        let route = (owned_msg.topic().to_string(), owned_msg.partition());
+
+                        // Insert the message into the vector for its route.
+                        // `entry` and `or_default` is an efficient way to do this.
+                        grouped_messages.entry(route).or_default().push(owned_msg);
+                    }
+                    Err(e) => {
+                        // Log Kafka errors but continue processing the rest of the chunk.
+                        tracing::error!("Error receiving message from Kafka: {}", e);
                     }
                 }
-                Err(e) => tracing::error!("Kafka error: {e}"),
+            }
+
+            // If the chunk was empty or only contained errors, there's nothing to dispatch.
+            if grouped_messages.is_empty() {
+                continue;
+            }
+
+            // Step 2: Dispatch the grouped messages
+            // Acquire a read lock on the senders map ONCE for the entire chunk.
+            // This is much more efficient than locking for each message.
+            let senders_guard = this.senders.read().await;
+
+            for (route, messages) in grouped_messages {
+                if let Some(sender) = senders_guard.get(&route) {
+                    // This inner loop sends all messages for the current route.
+                    for msg in messages {
+                        // We use `send()` here. If the downstream channel is full,
+                        // this will wait, effectively applying backpressure to the poll_loop.
+                        if sender.send(msg).await.is_err() {
+                            // The receiver was dropped, which means the downstream source
+                            // has been stopped. This is a normal and expected situation.
+                            // The `unregister_topic_partition_list` will clean up the sender from the map.
+                            break; // Stop sending to this closed channel.
+                        }
+                    }
+                }
+                // If no sender is found for a route, the messages for that route are simply dropped.
+                // This can happen if a source is unregistered while messages are in-flight.
             }
         }
     }
