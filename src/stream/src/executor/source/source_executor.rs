@@ -307,6 +307,10 @@ impl<S: StateStore> SourceExecutor<S> {
             target_state
         );
 
+        if source_desc.source.config.enable_mux_reader() {
+            stream.drop_data_stream();
+        }
+
         // Replace the source reader with a new one of the new state.
         let reader_stream_builder = self.stream_reader_builder(source_desc.clone());
         let reader_stream =

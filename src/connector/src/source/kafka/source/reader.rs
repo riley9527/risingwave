@@ -50,7 +50,7 @@ enum MessageReader {
     Consumer(StreamConsumer<RwConsumerContext>),
     MuxReader {
         reader: Arc<KafkaMuxReader>,
-        receiver: Receiver<OwnedMessage>,
+        receiver: Receiver<Vec<OwnedMessage>>,
     },
 }
 
@@ -74,15 +74,16 @@ async fn inner_owned_stream(reader: MessageReader) {
         }
         MessageReader::MuxReader { receiver, .. } => {
             let mut s = ReceiverStream::new(receiver);
-            while let Some(msg) = s.next().await {
-                yield msg;
+            while let Some(batch) = s.next().await {
+                for msg in batch {
+                    yield msg;
+                }
             }
         }
     }
 }
 
 pub struct KafkaSplitReader {
-    // consumer: StreamConsumer<RwConsumerContext>,
     message_reader: MessageReader,
     offsets: HashMap<SplitId, (Option<i64>, Option<i64>)>,
     backfill_info: HashMap<SplitId, BackfillInfo>,
@@ -139,6 +140,69 @@ impl<S> PinnedDrop for StreamWithSyncCleanup<S> {
         }
     }
 }
+
+#[async_trait]
+pub(crate) trait KafkaMetaFetcher {
+    async fn proxy_fetch_watermarks(
+        &self,
+        topic: &str,
+        partition: i32,
+        timeout: Duration,
+    ) -> rdkafka::error::KafkaResult<(i64, i64)>;
+}
+
+#[async_trait]
+impl<C: rdkafka::consumer::ConsumerContext + 'static> KafkaMetaFetcher for StreamConsumer<C> {
+    async fn proxy_fetch_watermarks(
+        &self,
+        topic: &str,
+        partition: i32,
+        timeout: Duration,
+    ) -> rdkafka::error::KafkaResult<(i64, i64)> {
+        Consumer::fetch_watermarks(self, topic, partition, timeout).await
+    }
+}
+
+async fn get_split_metadata<F: KafkaMetaFetcher + ?Sized>(
+    fetcher: &F,
+    splits: &[KafkaSplit],
+    sync_call_timeout: Duration,
+) -> Result<(TopicPartitionList, HashMap<SplitId, BackfillInfo>)> {
+    let mut tpl = TopicPartitionList::with_capacity(splits.len());
+    let mut backfill_info = HashMap::new();
+
+    for split in splits {
+        if let Some(offset) = split.start_offset {
+            tpl.add_partition_offset(
+                split.topic.as_str(),
+                split.partition,
+                Offset::Offset(offset + 1),
+            )?;
+        } else {
+            tpl.add_partition(split.topic.as_str(), split.partition);
+        }
+
+        let (low, high) = fetcher
+            .proxy_fetch_watermarks(split.topic.as_str(), split.partition, sync_call_timeout)
+            .await?;
+
+        tracing::info!("fetch kafka watermarks: low: {low}, high: {high}, split: {split:?}");
+
+        if low == high || split.start_offset.is_some_and(|offset| offset + 1 >= high) {
+            backfill_info.insert(split.id(), BackfillInfo::NoDataToBackfill);
+        } else {
+            debug_assert!(high > 0);
+            backfill_info.insert(
+                split.id(),
+                BackfillInfo::HasDataToBackfill {
+                    latest_offset: (high - 1).to_string(),
+                },
+            );
+        }
+    }
+    Ok((tpl, backfill_info))
+}
+
 #[async_trait]
 impl SplitReader for KafkaSplitReader {
     type Properties = KafkaProperties;
@@ -151,16 +215,16 @@ impl SplitReader for KafkaSplitReader {
         source_ctx: SourceContextRef,
         _columns: Option<Vec<Column>>,
     ) -> Result<Self> {
-        let mut offsets = HashMap::new();
-        let mut backfill_info = HashMap::new();
-
-        let mut tpl = TopicPartitionList::with_capacity(splits.len());
+        let offsets = splits
+            .iter()
+            .map(|split| (split.id(), (split.start_offset, split.stop_offset)))
+            .collect();
 
         let source_info = &source_ctx.source_info;
 
         let connection_id = source_info.as_ref().and_then(|s| s.connection_id);
 
-        let message_reader = if let Some(connection_id) = connection_id
+        let (message_reader, backfill_info) = if let Some(connection_id) = connection_id
             && properties.enable_mux_reader.unwrap_or(false)
         {
             let reader = KafkaMuxReader::get_or_create(
@@ -170,46 +234,12 @@ impl SplitReader for KafkaSplitReader {
             )
             .await?;
 
-            for split in splits.clone() {
-                offsets.insert(split.id(), (split.start_offset, split.stop_offset));
+            let (tpl, backfill_info) =
+                get_split_metadata(&*reader, &splits, properties.common.sync_call_timeout).await?;
 
-                if let Some(offset) = split.start_offset {
-                    tpl.add_partition_offset(
-                        split.topic.as_str(),
-                        split.partition,
-                        Offset::Offset(offset + 1),
-                    )?;
-                } else {
-                    tpl.add_partition(split.topic.as_str(), split.partition);
-                }
-
-                let (low, high) = reader
-                    .fetch_watermarks(
-                        split.topic.as_str(),
-                        split.partition,
-                        properties.common.sync_call_timeout,
-                    )
-                    .await?;
-                tracing::info!(
-                    "fetch kafka watermarks: low: {low}, high: {high}, split: {split:?}"
-                );
-                // note: low is inclusive, high is exclusive, start_offset is exclusive
-                if low == high || split.start_offset.is_some_and(|offset| offset + 1 >= high) {
-                    backfill_info.insert(split.id(), BackfillInfo::NoDataToBackfill);
-                } else {
-                    debug_assert!(high > 0);
-                    backfill_info.insert(
-                        split.id(),
-                        BackfillInfo::HasDataToBackfill {
-                            latest_offset: (high - 1).to_string(),
-                        },
-                    );
-                }
-            }
-            let receiver: Receiver<OwnedMessage> =
-                reader.register_topic_partition_list(tpl).await?;
-
-            MessageReader::MuxReader { reader, receiver }
+            let receiver = reader.register_topic_partition_list(tpl).await?;
+            let reader = MessageReader::MuxReader { reader, receiver };
+            (reader, backfill_info)
         } else {
             let mut config = ClientConfig::new();
 
@@ -252,46 +282,12 @@ impl SplitReader for KafkaSplitReader {
                 .await
                 .context("failed to create kafka consumer")?;
 
-            for split in splits.clone() {
-                offsets.insert(split.id(), (split.start_offset, split.stop_offset));
-
-                if let Some(offset) = split.start_offset {
-                    tpl.add_partition_offset(
-                        split.topic.as_str(),
-                        split.partition,
-                        Offset::Offset(offset + 1),
-                    )?;
-                } else {
-                    tpl.add_partition(split.topic.as_str(), split.partition);
-                }
-
-                let (low, high) = consumer
-                    .fetch_watermarks(
-                        split.topic.as_str(),
-                        split.partition,
-                        properties.common.sync_call_timeout,
-                    )
-                    .await?;
-                tracing::info!(
-                    "fetch kafka watermarks: low: {low}, high: {high}, split: {split:?}"
-                );
-                // note: low is inclusive, high is exclusive, start_offset is exclusive
-                if low == high || split.start_offset.is_some_and(|offset| offset + 1 >= high) {
-                    backfill_info.insert(split.id(), BackfillInfo::NoDataToBackfill);
-                } else {
-                    debug_assert!(high > 0);
-                    backfill_info.insert(
-                        split.id(),
-                        BackfillInfo::HasDataToBackfill {
-                            latest_offset: (high - 1).to_string(),
-                        },
-                    );
-                }
-            }
+            let (tpl, backfill_info) =
+                get_split_metadata(&consumer, &splits, properties.common.sync_call_timeout).await?;
 
             consumer.assign(&tpl)?;
-
-            MessageReader::Consumer(consumer)
+            let reader = MessageReader::Consumer(consumer);
+            (reader, backfill_info)
         };
 
         tracing::info!(
@@ -345,7 +341,13 @@ impl SplitReader for KafkaSplitReader {
                 }
 
                 ReleaseHandle::new(async move {
-                    let _ = reader.unregister_topic_partition_list(tpl).await;
+                    tracing::info!(
+                        "Kafka split reader dropping (mux reader mode), unregistering topic partition list: {:?}",
+                        tpl
+                    );
+                    if let Err(e) = reader.unregister_topic_partition_list(tpl).await {
+                        tracing::error!("Failed to unregister topic partition list: {}", e);
+                    }
                 })
             }
             _ => ReleaseHandle::noop(),
@@ -365,54 +367,50 @@ impl SplitReader for KafkaSplitReader {
     }
 
     async fn seek_to_latest(&mut self) -> Result<Vec<SplitImpl>> {
-        match &mut self.message_reader {
-            MessageReader::Consumer(consumer) => {
-                let mut latest_splits: Vec<SplitImpl> = Vec::new();
-                let mut tpl = TopicPartitionList::with_capacity(self.splits.len());
-                for mut split in self.splits.clone() {
-                    // we can't get latest offset if we use Offset::End, so we just fetch watermark here.
-                    let (_low, high) = consumer
-                        .fetch_watermarks(
-                            split.topic.as_str(),
-                            split.partition,
-                            self.sync_call_timeout,
-                        )
-                        .await?;
-                    tpl.add_partition_offset(
+        async fn fetch_latest_splits_meta<F: KafkaMetaFetcher + ?Sized>(
+            fetcher: &F,
+            splits: &[KafkaSplit],
+            sync_call_timeout: Duration,
+        ) -> Result<(Vec<SplitImpl>, TopicPartitionList)> {
+            let mut latest_splits: Vec<SplitImpl> = Vec::with_capacity(splits.len());
+            let mut tpl = TopicPartitionList::with_capacity(splits.len());
+
+            for mut split in splits.iter().cloned() {
+                // we can't get latest offset if we use Offset::End, so we just fetch watermark here.
+                let (_low, high) = fetcher
+                    .proxy_fetch_watermarks(
                         split.topic.as_str(),
                         split.partition,
-                        Offset::Offset(high),
-                    )?;
-                    split.start_offset = Some(high - 1);
-                    latest_splits.push(split.into());
-                }
+                        sync_call_timeout,
+                    )
+                    .await?;
+
+                tpl.add_partition_offset(
+                    split.topic.as_str(),
+                    split.partition,
+                    Offset::Offset(high),
+                )?;
+                split.start_offset = Some(high - 1);
+                latest_splits.push(split.into());
+            }
+
+            Ok((latest_splits, tpl))
+        }
+
+        match &mut self.message_reader {
+            MessageReader::Consumer(consumer) => {
+                let (latest_splits, tpl) =
+                    fetch_latest_splits_meta(consumer, &self.splits, self.sync_call_timeout)
+                        .await?;
                 // replace the previous assignment
                 consumer.assign(&tpl)?;
                 Ok(latest_splits)
             }
             MessageReader::MuxReader { reader, .. } => {
-                let mut latest_splits: Vec<SplitImpl> = Vec::new();
-                let mut tpl = TopicPartitionList::with_capacity(self.splits.len());
-                for mut split in self.splits.clone() {
-                    // we can't get latest offset if we use Offset::End, so we just fetch watermark here.
-                    let (_low, high) = reader
-                        .fetch_watermarks(
-                            split.topic.as_str(),
-                            split.partition,
-                            self.sync_call_timeout,
-                        )
+                let (latest_splits, tpl) =
+                    fetch_latest_splits_meta(&**reader, &self.splits, self.sync_call_timeout)
                         .await?;
-                    tpl.add_partition_offset(
-                        split.topic.as_str(),
-                        split.partition,
-                        Offset::Offset(high),
-                    )?;
-                    split.start_offset = Some(high - 1);
-                    latest_splits.push(split.into());
-                }
-
                 let _ = reader.seek(tpl, self.sync_call_timeout).await?;
-
                 Ok(latest_splits)
             }
         }

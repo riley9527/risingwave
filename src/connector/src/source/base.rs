@@ -502,13 +502,6 @@ impl ReleaseHandle {
         self.task.take()
     }
 }
-// impl Drop for ReleaseHandle {
-//     fn drop(&mut self) {
-//         if let Some(fut) = self.task.take() {
-//             tokio::spawn(fut);
-//         }
-//     }
-// }
 
 /// [`SplitReader`] is a new abstraction of the external connector read interface which is
 /// responsible for parsing, it is used to read messages from the outside and transform them into a
@@ -654,6 +647,14 @@ impl ConnectorProperties {
             || matches!(self, ConnectorProperties::OpendalS3(_))
             || matches!(self, ConnectorProperties::Gcs(_))
             || matches!(self, ConnectorProperties::Azblob(_))
+    }
+
+    pub fn enable_mux_reader(&self) -> bool {
+        if let ConnectorProperties::Kafka(k) = self {
+            return k.enable_mux_reader.unwrap_or(false);
+        }
+
+        false
     }
 
     pub fn unique_key_under_connection(&self) -> Option<String> {

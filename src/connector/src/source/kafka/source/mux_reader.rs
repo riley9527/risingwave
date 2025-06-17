@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use futures::StreamExt;
+use futures_async_stream::for_await;
 use once_cell::sync::OnceCell;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::error::KafkaResult;
@@ -31,16 +33,17 @@ use crate::source::SourceContextRef;
 use crate::source::kafka::{
     KAFKA_ISOLATION_LEVEL, KafkaContextCommon, KafkaProperties, RwConsumerContext,
 };
-
 /// Global key == `connection_id` (already unique in metadata)
 pub type ReaderKey = String;
+
+type PartitionRoute = (String, i32);
 
 pub struct KafkaMuxReader {
     key: ReaderKey,
 
     consumer: StreamConsumer<RwConsumerContext>,
     /// (topic, partition) -> sender (each topic unique within this connection)
-    senders: RwLock<HashMap<(String, i32), mpsc::Sender<OwnedMessage>>>,
+    senders: RwLock<HashMap<PartitionRoute, mpsc::Sender<Vec<OwnedMessage>>>>,
 }
 
 static GLOBAL: OnceCell<RwLock<HashMap<ReaderKey, Arc<KafkaMuxReader>>>> = OnceCell::new();
@@ -109,85 +112,48 @@ impl KafkaMuxReader {
             consumer,
             senders: RwLock::new(HashMap::new()),
         });
+
+        let max_chunk_size = source_ctx.source_ctrl_opts.chunk_size;
+
         Self::registry()
             .write()
             .await
             .insert(connection_id, Arc::clone(&reader));
-        tokio::spawn(Self::poll_loop(Arc::clone(&reader)));
+        tokio::spawn(Self::poll_loop(Arc::clone(&reader), max_chunk_size));
         Ok(reader)
     }
 
-    // async fn poll_loop(this: Arc<Self>) {
-    //     let mut stream = this.consumer.stream();
-    //     while let Some(res) = stream.next().await {
-    //         match res {
-    //             Ok(m) => {
-    //                 let owned = m.detach();
-    //                 let key = (owned.topic().to_owned(), owned.partition());
-    //                 if let Some(tx) = this.senders.read().await.get(&key) {
-    //                     let _ = tx.send(owned).await;
-    //                 }
-    //             }
-    //             Err(e) => tracing::error!("Kafka error: {e}"),
-    //         }
-    //     }
-    // }
-
-    async fn poll_loop(this: Arc<Self>) {
-        let mut stream = this.consumer.stream();
-        // The maximum number of messages to buffer in one chunk.
-        // This can be made configurable if needed.
-        const CHUNK_SIZE: usize = 1024;
+    async fn poll_loop(this: Arc<Self>, max_chunk_size: usize) {
+        let stream = this.consumer.stream();
 
         #[for_await]
-        for messages_result in stream.ready_chunks(CHUNK_SIZE) {
-            // Step 1: Group messages by route (topic, partition)
-            // We use a temporary HashMap for efficient grouping.
-            let mut grouped_messages: HashMap<(String, i32), Vec<OwnedMessage>> = HashMap::new();
+        for messages_result in stream.ready_chunks(max_chunk_size) {
+            let owned_msgs: Vec<_> = messages_result
+                .into_iter()
+                .filter_map(|res| res.ok().map(|m| m.detach()))
+                .collect();
 
-            for res in messages_result {
-                match res {
-                    Ok(borrowed_msg) => {
-                        let owned_msg = borrowed_msg.detach();
-                        let route = (owned_msg.topic().to_string(), owned_msg.partition());
-
-                        // Insert the message into the vector for its route.
-                        // `entry` and `or_default` is an efficient way to do this.
-                        grouped_messages.entry(route).or_default().push(owned_msg);
-                    }
-                    Err(e) => {
-                        // Log Kafka errors but continue processing the rest of the chunk.
-                        tracing::error!("Error receiving message from Kafka: {}", e);
-                    }
-                }
-            }
-
-            // If the chunk was empty or only contained errors, there's nothing to dispatch.
-            if grouped_messages.is_empty() {
+            if owned_msgs.is_empty() {
                 continue;
             }
 
-            // Step 2: Dispatch the grouped messages
-            // Acquire a read lock on the senders map ONCE for the entire chunk.
-            // This is much more efficient than locking for each message.
+            let mut grouped_messages: HashMap<(&str, i32), Vec<OwnedMessage>> = HashMap::new();
+
+            for msg in &owned_msgs {
+                let route = (msg.topic(), msg.partition());
+                grouped_messages.entry(route).or_default().push(msg.clone());
+            }
+
             let senders_guard = this.senders.read().await;
 
-            for (route, messages) in grouped_messages {
-                if let Some(sender) = senders_guard.get(&route) {
-                    // This inner loop sends all messages for the current route.
-                    for msg in messages {
-                        // We use `send()` here. If the downstream channel is full,
-                        // this will wait, effectively applying backpressure to the poll_loop.
-                        if sender.send(msg).await.is_err() {
-                            // The receiver was dropped, which means the downstream source
-                            // has been stopped. This is a normal and expected situation.
-                            // The `unregister_topic_partition_list` will clean up the sender from the map.
-                            break; // Stop sending to this closed channel.
-                        }
+            for ((topic, partition), messages) in grouped_messages {
+                let key = (topic.to_owned(), partition);
+                if let Some(sender) = senders_guard.get(&key) {
+                    if sender.send(messages).await.is_err() {
+                        // todo
+                        break;
                     }
                 }
-                // If no sender is found for a route, the messages for that route are simply dropped.
-                // This can happen if a source is unregistered while messages are in-flight.
             }
         }
     }
@@ -195,7 +161,7 @@ impl KafkaMuxReader {
     pub async fn register_topic_partition_list(
         &self,
         tpl: TopicPartitionList,
-    ) -> anyhow::Result<mpsc::Receiver<OwnedMessage>> {
+    ) -> anyhow::Result<mpsc::Receiver<Vec<OwnedMessage>>> {
         if tpl.count() == 0 {
             anyhow::bail!("splits list is empty");
         }
@@ -215,7 +181,7 @@ impl KafkaMuxReader {
             }
         }
         // sender / receiver
-        let (tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(128);
         {
             let mut map = self.senders.write().await;
             for element in tpl.elements() {
@@ -233,7 +199,7 @@ impl KafkaMuxReader {
     }
 
     pub async fn unregister_topic_partition_list(
-        &self,
+        self: Arc<Self>,
         tpl: TopicPartitionList,
     ) -> anyhow::Result<()> {
         if tpl.count() == 0 {
@@ -245,38 +211,36 @@ impl KafkaMuxReader {
             tpl,
             self.key
         );
-        {
-            let map = self.senders.read().await;
-            for element in tpl.elements() {
-                let key = (element.topic().to_owned(), element.partition());
-                if !map.contains_key(&key) {
-                    tracing::error!("split ({:?}) not registered", key);
-                }
-            }
-        }
+
+        let is_empty_after_removal;
         {
             let mut map = self.senders.write().await;
             for element in tpl.elements() {
                 map.remove(&(element.topic().to_owned(), element.partition()));
             }
+            is_empty_after_removal = map.is_empty();
         }
 
         self.consumer
             .incremental_unassign(&tpl)
             .map_err(|e| anyhow::anyhow!("unassign failed: {e}"))?;
-        Ok(())
-    }
 
-    /// Allow `fetch_watermarks` for backfill / seek‑to‑latest use‑cases
-    pub async fn fetch_watermarks(
-        &self,
-        topic: &str,
-        partition: i32,
-        timeout: Duration,
-    ) -> rdkafka::error::KafkaResult<(i64, i64)> {
-        self.consumer
-            .fetch_watermarks(topic, partition, timeout)
-            .await
+        if is_empty_after_removal {
+            tracing::info!(
+                "All partitions unregistered for mux reader {}. Removing from global registry.",
+                self.key
+            );
+
+            // Now we can safely access the key and remove from the global registry.
+            Self::registry().write().await.remove(&self.key);
+
+            tracing::info!(
+                "Successfully removed mux reader {} from the global registry.",
+                self.key
+            );
+        }
+
+        Ok(())
     }
 
     pub async fn seek(
@@ -286,6 +250,22 @@ impl KafkaMuxReader {
     ) -> KafkaResult<TopicPartitionList> {
         self.consumer
             .seek_partitions(topic_partition_list.clone(), sync_call_timeout)
+            .await
+    }
+}
+
+use crate::source::kafka::source::reader::KafkaMetaFetcher;
+
+#[async_trait]
+impl KafkaMetaFetcher for KafkaMuxReader {
+    async fn proxy_fetch_watermarks(
+        &self,
+        topic: &str,
+        partition: i32,
+        timeout: Duration,
+    ) -> KafkaResult<(i64, i64)> {
+        self.consumer
+            .fetch_watermarks(topic, partition, timeout)
             .await
     }
 }
