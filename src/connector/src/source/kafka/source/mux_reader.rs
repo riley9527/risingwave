@@ -36,6 +36,8 @@ use crate::source::kafka::{
 pub type ReaderKey = String;
 
 pub struct KafkaMuxReader {
+    key: ReaderKey,
+
     consumer: StreamConsumer<RwConsumerContext>,
     /// (topic, partition) -> sender (each topic unique within this connection)
     senders: RwLock<HashMap<(String, i32), mpsc::Sender<OwnedMessage>>>,
@@ -103,6 +105,7 @@ impl KafkaMuxReader {
             .context("failed to create kafka consumer")?;
 
         let reader = Arc::new(Self {
+            key: connection_id.clone(),
             consumer,
             senders: RwLock::new(HashMap::new()),
         });
@@ -137,6 +140,12 @@ impl KafkaMuxReader {
         if tpl.count() == 0 {
             anyhow::bail!("splits list is empty");
         }
+
+        tracing::info!(
+            "Registering topic partition list: {:?} in mux reader {}",
+            tpl,
+            self.key
+        );
         {
             let map = self.senders.read().await;
             for element in tpl.elements() {
@@ -171,12 +180,18 @@ impl KafkaMuxReader {
         if tpl.count() == 0 {
             return Ok(());
         }
+
+        tracing::info!(
+            "Unregistering topic partition list: {:?} in mux reader {}",
+            tpl,
+            self.key
+        );
         {
             let map = self.senders.read().await;
             for element in tpl.elements() {
                 let key = (element.topic().to_owned(), element.partition());
                 if !map.contains_key(&key) {
-                    anyhow::bail!("split ({:?}) not registered", key);
+                    tracing::error!("split ({:?}) not registered", key);
                 }
             }
         }

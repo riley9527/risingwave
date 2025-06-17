@@ -160,7 +160,9 @@ impl SplitReader for KafkaSplitReader {
 
         let connection_id = source_info.as_ref().and_then(|s| s.connection_id);
 
-        let message_reader = if let Some(connection_id) = connection_id {
+        let message_reader = if let Some(connection_id) = connection_id
+            && properties.enable_mux_reader.unwrap_or(false)
+        {
             let reader = KafkaMuxReader::get_or_create(
                 connection_id.to_string(),
                 properties.clone(),

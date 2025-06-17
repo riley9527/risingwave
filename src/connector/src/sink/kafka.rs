@@ -233,6 +233,8 @@ pub struct KafkaConfig {
     )]
     pub retry_interval: Duration,
 
+    pub enable_mux_reader: bool,
+
     /// We have parsed the primary key for an upsert kafka sink into a `usize` vector representing
     /// the indices of the pk columns in the frontend, so we simply store the primary key here
     /// as a string.
@@ -249,8 +251,6 @@ pub struct KafkaConfig {
 
     #[serde(flatten)]
     pub aws_auth_props: AwsAuthProps,
-
-    pub enable_mux_reader: bool,
 }
 
 impl EnforceSecret for KafkaConfig {
@@ -291,8 +291,7 @@ impl From<KafkaConfig> for KafkaProperties {
             aws_auth_props: val.aws_auth_props,
             group_id_prefix: None,
             unknown_fields: Default::default(),
-            // todo
-            enable_mux_reader: true,
+            enable_mux_reader: None,
         }
     }
 }
