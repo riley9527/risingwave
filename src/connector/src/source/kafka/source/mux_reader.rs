@@ -128,7 +128,7 @@ impl KafkaMuxReader {
 
         #[for_await]
         for messages_result in stream.ready_chunks(max_chunk_size) {
-            let owned_msgs: Vec<_> = messages_result
+            let owned_msgs: Vec<OwnedMessage> = messages_result
                 .into_iter()
                 .filter_map(|res| res.ok().map(|m| m.detach()))
                 .collect();
@@ -137,21 +137,38 @@ impl KafkaMuxReader {
                 continue;
             }
 
-            let mut grouped_messages: HashMap<(&str, i32), Vec<OwnedMessage>> = HashMap::new();
+            let mut grouped_messages: HashMap<String, HashMap<i32, Vec<OwnedMessage>>> =
+                HashMap::new();
 
-            for msg in &owned_msgs {
-                let route = (msg.topic(), msg.partition());
-                grouped_messages.entry(route).or_default().push(msg.clone());
+            for msg in owned_msgs {
+                let topic_str = msg.topic();
+                let partition_num = msg.partition();
+
+                if !grouped_messages.contains_key(topic_str) {
+                    grouped_messages.insert(topic_str.to_owned(), HashMap::new());
+                }
+
+                grouped_messages
+                    .get_mut(topic_str)
+                    .unwrap()
+                    .entry(partition_num)
+                    .or_default()
+                    .push(msg);
             }
 
             let senders_guard = this.senders.read().await;
 
-            for ((topic, partition), messages) in grouped_messages {
-                let key = (topic.to_owned(), partition);
-                if let Some(sender) = senders_guard.get(&key) {
-                    if sender.send(messages).await.is_err() {
-                        // todo
-                        break;
+            for (topic, partition_map) in grouped_messages {
+                for (partition, messages) in partition_map {
+                    let key = (topic.clone(), partition);
+                    if let Some(sender) = senders_guard.get(&key) {
+                        if sender.send(messages).await.is_err() {
+                            eprintln!(
+                                "Failed to send messages to topic '{}' partition {}. Receiver is closed.",
+                                topic, partition
+                            );
+                            break;
+                        }
                     }
                 }
             }
