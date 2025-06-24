@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{ConfigParam, FormatEncodeOptions, SqlOption};
 use crate::ast::{
-    display_comma_separated, display_separated, DataType, Expr, Ident, ObjectName, Query, SecretRefValue, SetVariableValue, Value
+    DataType, Expr, Ident, ObjectName, Query, SecretRefValue, SetVariableValue, Value,
+    display_comma_separated, display_separated,
 };
 use crate::tokenizer::Token;
 
