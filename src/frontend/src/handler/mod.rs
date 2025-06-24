@@ -43,6 +43,7 @@ use crate::session::SessionImpl;
 use crate::utils::WithOptions;
 
 mod alter_database_param;
+mod alter_mv;
 mod alter_owner;
 mod alter_parallelism;
 mod alter_rename;
@@ -979,6 +980,12 @@ pub async fn handle(
                         statement_type,
                     )
                     .await
+                }
+                AlterViewOperation::AsQuery { query } => {
+                    if !materialized {
+                        bail_not_implemented!("ALTER VIEW AS QUERY");
+                    }
+                    alter_mv::handle_alter_mv(handler_args, name, query).await
                 }
             }
         }

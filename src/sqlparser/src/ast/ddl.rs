@@ -22,8 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ConfigParam, FormatEncodeOptions, SqlOption};
 use crate::ast::{
-    DataType, Expr, Ident, ObjectName, SecretRefValue, SetVariableValue, Value,
-    display_comma_separated, display_separated,
+    display_comma_separated, display_separated, DataType, Expr, Ident, ObjectName, Query, SecretRefValue, SetVariableValue, Value
 };
 use crate::tokenizer::Token;
 
@@ -168,6 +167,10 @@ pub enum AlterViewOperation {
     /// `SWAP WITH <view_name>`
     SwapRenameView {
         target_view: ObjectName,
+    },
+    /// `AS <query>`
+    AsQuery {
+        query: Box<Query>,
     },
 }
 
@@ -447,6 +450,9 @@ impl fmt::Display for AlterViewOperation {
                 } else {
                     write!(f, "RESET RESOURCE_GROUP {}", deferred)
                 }
+            }
+            AlterViewOperation::AsQuery { query } => {
+                write!(f, "AS {}", query)
             }
         }
     }

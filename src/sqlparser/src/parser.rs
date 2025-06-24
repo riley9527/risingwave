@@ -3492,7 +3492,10 @@ impl Parser<'_> {
 
     pub fn parse_alter_view(&mut self, materialized: bool) -> ModalResult<Statement> {
         let view_name = self.parse_object_name()?;
-        let operation = if self.parse_keyword(Keyword::RENAME) {
+        let operation = if self.parse_keyword(Keyword::AS) {
+            let query = Box::new(self.parse_query()?);
+            AlterViewOperation::AsQuery { query }
+        } else if self.parse_keyword(Keyword::RENAME) {
             if self.parse_keyword(Keyword::TO) {
                 let view_name = self.parse_object_name()?;
                 AlterViewOperation::RenameView { view_name }
@@ -3562,7 +3565,7 @@ impl Parser<'_> {
             }
         } else {
             return self.expected(&format!(
-                "RENAME or OWNER TO or SET or SWAP after ALTER {}VIEW",
+                "AS, RENAME, OWNER TO, SET, or SWAP after ALTER {}VIEW",
                 if materialized { "MATERIALIZED " } else { "" }
             ));
         };
