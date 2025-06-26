@@ -3,7 +3,15 @@ FROM ubuntu:24.04 AS base
 ENV LANG en_US.utf8
 
 RUN apt-get update \
-  && apt-get -y install ca-certificates build-essential libsasl2-dev openjdk-17-jdk software-properties-common python3.12 python3.12-dev openssl pkg-config curl git
+  && apt-get -y install ca-certificates build-essential libsasl2-dev software-properties-common python3.12 python3.12-dev openssl pkg-config curl git wget
+
+# Install kona jdk
+COPY TencentKona-17.0.15.b1-jdk_linux-x86_64.tar.gz TencentKona-17.0.15.b1-jdk_linux-x86_64.tar.gz
+RUN mkdir -p /opt/jdk & tar xvf TencentKona-17.0.15.b1-jdk_linux-x86_64.tar.gz -C /opt/jdk && rm TencentKona-17.0.15.b1-jdk_linux-x86_64.tar.gz
+
+ENV JAVA_HOME=/opt/jdk/TencentKona-17.0.15.b1/ \
+    PATH=/opt/jdk/TencentKona-17.0.15.b1/bin/:$PATH \
+    CLASSPATH=/opt/jdk/TencentKona-17.0.15.b1/lib
 
 FROM base AS rust-base
 
@@ -33,8 +41,8 @@ RUN rustup self update \
   && rustup component add rustfmt \
   && rustup target add wasm32-wasip1
 
-RUN cargo install flamegraph
-RUN cargo install addr2line --features bin --bin addr2line
+RUN cargo install flamegraph --version 0.6.8
+RUN cargo install addr2line --features bin --bin addr2line --version 0.25.0
 
 # TODO: cargo-chef doesn't work well now, because we update Cargo.lock very often.
 # We may consider sccache instead.
@@ -66,7 +74,7 @@ ARG GIT_SHA
 ENV GIT_SHA=$GIT_SHA
 
 ARG CARGO_PROFILE
-ENV CARGO_PROFILE=$CARGO_PROFILE
+ENV CARGO_PROFILE=release
 
 COPY ./ /risingwave
 WORKDIR /risingwave
@@ -146,6 +154,14 @@ ENV PLAYGROUND_PROFILE docker-playground
 # Set default connector libs path
 ENV CONNECTOR_LIBS_PATH /risingwave/bin/connector-node/libs
 ENV IN_CONTAINER=1
+
+# 在构建最后一行执行清理
+RUN rm -rf /run/systemd/resolve/* && \
+    mkdir -p /run/systemd/resolve/ && \
+    touch /run/systemd/resolve/stub-resolv.conf
+
+# copy bkbase-udf
+COPY bkbase_udf.wasm /opt/
 
 ENTRYPOINT [ "/risingwave/bin/risingwave" ]
 CMD [ "single_node" ]
