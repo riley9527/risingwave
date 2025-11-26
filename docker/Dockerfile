@@ -3,8 +3,16 @@ FROM ubuntu:24.04 AS base
 ENV LANG en_US.utf8
 
 RUN apt-get update \
-  && apt-get -y install ca-certificates build-essential libsasl2-dev openjdk-17-jdk software-properties-common \
-    python3.12 python3.12-dev openssl pkg-config curl git libblas-dev liblapack-dev libomp-dev
+  && apt-get -y install ca-certificates build-essential libsasl2-dev software-properties-common \
+    python3.12 python3.12-dev openssl pkg-config curl git libblas-dev liblapack-dev libomp-dev wget
+
+# Install kona jdk
+COPY TencentKona-17.0.15.b1-jdk_linux-x86_64.tar.gz TencentKona-17.0.15.b1-jdk_linux-x86_64.tar.gz
+RUN mkdir -p /opt/jdk & tar xvf TencentKona-17.0.15.b1-jdk_linux-x86_64.tar.gz -C /opt/jdk && rm TencentKona-17.0.15.b1-jdk_linux-x86_64.tar.gz
+
+ENV JAVA_HOME=/opt/jdk/TencentKona-17.0.15.b1/ \
+    PATH=/opt/jdk/TencentKona-17.0.15.b1/bin/:$PATH \
+    CLASSPATH=/opt/jdk/TencentKona-17.0.15.b1/lib
 
 FROM base AS rust-base
 
@@ -67,7 +75,7 @@ ARG GIT_SHA
 ENV GIT_SHA=$GIT_SHA
 
 ARG CARGO_PROFILE
-ENV CARGO_PROFILE=$CARGO_PROFILE
+ENV CARGO_PROFILE=release
 
 COPY ./ /risingwave
 WORKDIR /risingwave
@@ -147,6 +155,11 @@ ENV PLAYGROUND_PROFILE docker-playground
 # Set default connector libs path
 ENV CONNECTOR_LIBS_PATH /risingwave/bin/connector-node/libs
 ENV IN_CONTAINER=1
+
+# copy bkbase-udf
+COPY bkbase_udf.wasm /opt/
+COPY hive-exec-4.1.0.jar /risingwave/bin/connector-node/libs/
+COPY hadoop-client-runtime-3.4.1.jar /risingwave/bin/connector-node/libs/
 
 ENTRYPOINT [ "/risingwave/bin/risingwave" ]
 CMD [ "single_node" ]
